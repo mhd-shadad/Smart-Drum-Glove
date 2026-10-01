@@ -1,0 +1,6 @@
+{
+    "open_hihat": { "fingers": [1],          "midi_note": 46, "cooldown": 0.20 },
+    "ride":       { "fingers": [1, 2],       "midi_note": 51, "cooldown": 0.20 },
+    "china":      { "fingers": [1, 2, 3],    "midi_note": 52, "cooldown": 0.25 },
+    "crash":      { "fingers": [1, 2, 3, 4], "midi_note": 49, "cooldown": 0.30 }
+}

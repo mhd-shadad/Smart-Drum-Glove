@@ -1,0 +1,7 @@
+{
+  "kick":         { "midi_note": 36, "finger": 1, "cooldown": 0.15, "requires_movement": false },
+  "snare":        { "midi_note": 38, "finger": 2, "cooldown": 0.15, "requires_movement": true  },
+  "closed_hihat": { "midi_note": 42, "finger": 3, "cooldown": 0.10, "requires_movement": false },
+  "tom":          { "midi_note": 47, "finger": 4, "cooldown": 0.15, "requires_movement": false },
+  "crash":        { "midi_note": 49, "finger": 0, "cooldown": 0.40, "requires_movement": true  }
+}

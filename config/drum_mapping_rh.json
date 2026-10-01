@@ -1,0 +1,6 @@
+{
+    "kick":   { "fingers": [1],          "midi_note": 36, "cooldown": 0.20 },
+    "snare":  { "fingers": [1, 2],       "midi_note": 38, "cooldown": 0.20 },
+    "hihat":  { "fingers": [1, 2, 3],    "midi_note": 42, "cooldown": 0.20 },
+    "tom":    { "fingers": [1, 2, 3, 4], "midi_note": 47, "cooldown": 0.20 }
+}

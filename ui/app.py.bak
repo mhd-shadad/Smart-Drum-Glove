@@ -1,0 +1,618 @@
+"""
+Smart Drum Glove — PySide6 Desktop UI.
+Adapted for flex sensors with small dynamic range.
+"""
+
+import os
+import sys
+import time
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QComboBox,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QProgressBar,
+    QSlider, QTextEdit, QMessageBox
+)
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from backend.serial_reader import SerialReader
+from backend.calibration import CalibrationManager
+from backend.gesture_engine import GestureEngine
+from backend.drum_mapper import load_mapping, note_for
+from backend.midi_engine import MidiEngine
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "config", "drum_mapping.json")
+
+DRUM_PAD_ORDER = ["kick", "snare", "closed_hihat", "tom", "crash"]
+PAD_LABELS = {
+    "kick": "KICK",
+    "snare": "SNARE",
+    "closed_hihat": "HI-HAT",
+    "tom": "TOM",
+    "crash": "CRASH",
+}
+
+
+# ------------------------------------------------------------------
+class SensorBar(QWidget):
+    def __init__(self, name: str):
+        super().__init__()
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 4095)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(16)
+        self.val = QLabel("0")
+        self.val.setFixedWidth(60)
+        self.val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.val.setStyleSheet("color:#9ef;font-weight:600;")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(QLabel(name), 0)
+        lay.addWidget(self.bar, 1)
+        lay.addWidget(self.val, 0)
+
+    def set_value(self, v: int):
+        self.bar.setValue(int(v))
+        self.val.setText(str(int(v)))
+
+
+class BendBar(QWidget):
+    """Shows current bend amount and marks the threshold."""
+    def __init__(self, name: str):
+        super().__init__()
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 500)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(14)
+        self.bar.setStyleSheet("""
+            QProgressBar { background:#1d1f26; border-radius:6px; }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #7af0c4, stop:1 #35c3ff);
+                border-radius:6px;
+            }
+        """)
+        self.val = QLabel("0")
+        self.val.setFixedWidth(70)
+        self.val.setStyleSheet("color:#7af0c4;font-family:Consolas;")
+        self.val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(QLabel(name), 0)
+        lay.addWidget(self.bar, 1)
+        lay.addWidget(self.val, 0)
+
+    def set_value(self, v: float, threshold: float):
+        v_int = max(0, min(500, int(v)))
+        self.bar.setValue(v_int)
+        status = "🔥" if v > threshold else "  "
+        self.val.setText(f"{int(v):>4} {status}")
+
+
+class DrumPad(QPushButton):
+    def __init__(self, key: str):
+        super().__init__(PAD_LABELS[key])
+        self.key = key
+        self.setMinimumHeight(70)
+        self.setStyleSheet(self._style(False))
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(lambda: self.setStyleSheet(self._style(False)))
+
+    def _style(self, active: bool):
+        base = """
+        QPushButton {
+            border-radius: 10px;
+            font-size: 18px;
+            font-weight: 700;
+            color: #eee;
+            background: %s;
+            border: 2px solid %s;
+        }
+        """
+        if active:
+            return base % ("#ff6b3d", "#ffd0b0")
+        return base % ("#25272e", "#3a3d46")
+
+    def flash(self):
+        self.setStyleSheet(self._style(True))
+        self._flash_timer.start(140)
+
+
+# ------------------------------------------------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Smart Drum Glove")
+        self.resize(1360, 800)
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background:#15171c; color:#e6e8ee; }
+            QGroupBox {
+                border:1px solid #2b2e37; border-radius:8px;
+                margin-top:10px; padding:10px; font-weight:600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; left:10px; padding:0 6px;
+                color:#9ef;
+            }
+            QPushButton { background:#25272e; border:1px solid #3a3d46;
+                          border-radius:6px; padding:6px 12px; }
+            QPushButton:hover { background:#2f323b; }
+            QComboBox { background:#1d1f26; border:1px solid #3a3d46;
+                        border-radius:6px; padding:4px; }
+            QTextEdit { background:#0f1114; border:1px solid #2b2e37;
+                        border-radius:6px; font-family:Consolas, monospace; }
+            QProgressBar { background:#1d1f26; border-radius:6px; }
+            QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #35c3ff, stop:1 #7af0c4); border-radius:6px; }
+            QSlider::groove:horizontal { height:6px; background:#25272e; border-radius:3px; }
+            QSlider::handle:horizontal { background:#35c3ff; width:14px;
+                                         margin:-5px 0; border-radius:7px; }
+        """)
+
+        self.mapping = load_mapping(CONFIG_PATH)
+        self.reader = SerialReader()
+        self.calib = CalibrationManager()
+
+        # Lower defaults for small-range flex sensors
+        self.settings = {
+            "flex1_threshold": 20,
+            "flex2_threshold": 20,
+            "flex3_threshold": 20,
+            "flex4_threshold": 20,
+            "movement_threshold": 5.0,
+            "rotation_threshold": 40.0,
+            "gesture_cooldown": 0.15,
+            "smoothing": 0.35,
+            "velocity_sensitivity": 2.0,
+        }
+        self.engine = GestureEngine(self.mapping, self.settings)
+        self.midi = MidiEngine()
+
+        self._filt = {k: None for k in
+                      ("f1", "f2", "f3", "f4", "ax", "ay", "az", "gx", "gy", "gz")}
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        root.addLayout(self._build_left_column(), 3)
+        root.addLayout(self._build_middle_column(), 3)
+        root.addLayout(self._build_right_column(), 4)
+
+        self.reader.data_received.connect(self.on_data)
+        self.reader.error_occurred.connect(self.on_error)
+        self.reader.connection_changed.connect(self.on_connection)
+
+        self.refresh_ports()
+        self.refresh_midi_ports()
+
+        self._refresh_ports_timer = QTimer(self)
+        self._refresh_ports_timer.timeout.connect(self.refresh_ports)
+        self._refresh_ports_timer.start(3000)
+
+    # -----------------------------------------------------------
+    def _build_left_column(self):
+        col = QVBoxLayout()
+
+        gb = QGroupBox("Connection")
+        v = QVBoxLayout(gb)
+        self.port_combo = QComboBox()
+        self.refresh_btn = QPushButton("Refresh Ports")
+        self.refresh_btn.clicked.connect(self.refresh_ports)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Serial Port:"))
+        row1.addWidget(self.port_combo, 1)
+        row1.addWidget(self.refresh_btn)
+        v.addLayout(row1)
+
+        self.status_lbl = QLabel("ESP32 Status: Disconnected")
+        self.status_lbl.setStyleSheet("color:#ff8080;font-weight:600;")
+        v.addWidget(self.status_lbl)
+
+        row2 = QHBoxLayout()
+        self.connect_btn = QPushButton("Connect")
+        self.disconnect_btn = QPushButton("Disconnect")
+        self.disconnect_btn.setEnabled(False)
+        self.connect_btn.clicked.connect(self.on_connect)
+        self.disconnect_btn.clicked.connect(self.on_disconnect)
+        row2.addWidget(self.connect_btn)
+        row2.addWidget(self.disconnect_btn)
+        v.addLayout(row2)
+        col.addWidget(gb)
+
+        gb = QGroupBox("Raw Sensor Monitor")
+        v = QVBoxLayout(gb)
+        self.flex_bars = [SensorBar(f"Finger {i+1}") for i in range(4)]
+        for b in self.flex_bars:
+            v.addWidget(b)
+        v.addWidget(QLabel("ACCELEROMETER"))
+        self.acc_lbl = QLabel("X: 0.00   Y: 0.00   Z: 0.00")
+        self.acc_lbl.setStyleSheet("font-family:Consolas;color:#9ef;")
+        v.addWidget(self.acc_lbl)
+        v.addWidget(QLabel("GYROSCOPE"))
+        self.gyro_lbl = QLabel("X: 0.0   Y: 0.0   Z: 0.0")
+        self.gyro_lbl.setStyleSheet("font-family:Consolas;color:#9ef;")
+        v.addWidget(self.gyro_lbl)
+        self.mv_lbl = QLabel("Movement: 0.0")
+        self.mv_lbl.setStyleSheet("color:#f6c;font-weight:600;")
+        v.addWidget(self.mv_lbl)
+        col.addWidget(gb)
+
+        gb = QGroupBox("Live Bend (baseline − current)")
+        v = QVBoxLayout(gb)
+        self.bend_bars = [BendBar(f"F{i+1}") for i in range(4)]
+        for b in self.bend_bars:
+            v.addWidget(b)
+        hint = QLabel("🔥 = above threshold → trigger")
+        hint.setStyleSheet("color:#9ab;font-size:11px;")
+        v.addWidget(hint)
+        col.addWidget(gb)
+
+        gb = QGroupBox("Calibration")
+        v = QVBoxLayout(gb)
+        self.calib_status = QLabel("Calibration: NOT READY")
+        v.addWidget(self.calib_status)
+        self.calib_bar = QProgressBar()
+        self.calib_bar.setRange(0, 100)
+        v.addWidget(self.calib_bar)
+        row = QHBoxLayout()
+        self.calib_btn = QPushButton("CALIBRATE")
+        self.calib_btn.clicked.connect(self.on_calibrate)
+        row.addWidget(self.calib_btn)
+        self.suggest_btn = QPushButton("Suggest Thresholds")
+        self.suggest_btn.setEnabled(False)
+        self.suggest_btn.clicked.connect(self.on_suggest)
+        row.addWidget(self.suggest_btn)
+        v.addLayout(row)
+        self.calib_info = QLabel("Press CALIBRATE with hand open & still.")
+        self.calib_info.setWordWrap(True)
+        self.calib_info.setStyleSheet("color:#9ab;font-size:11px;")
+        v.addWidget(self.calib_info)
+        col.addWidget(gb)
+        col.addStretch(1)
+        return col
+
+    # -----------------------------------------------------------
+    def _build_middle_column(self):
+        col = QVBoxLayout()
+
+        gb = QGroupBox("CURRENT HIT")
+        v = QVBoxLayout(gb)
+        self.hit_lbl = QLabel("—")
+        self.hit_lbl.setAlignment(Qt.AlignCenter)
+        self.hit_lbl.setStyleSheet("font-size:42px;font-weight:800;color:#ffb46b;")
+        v.addWidget(self.hit_lbl)
+        self.hit_note_lbl = QLabel("MIDI NOTE: —")
+        self.hit_note_lbl.setAlignment(Qt.AlignCenter)
+        self.hit_note_lbl.setStyleSheet("font-size:14px;color:#9ef;")
+        v.addWidget(self.hit_note_lbl)
+        self.hit_vel_lbl = QLabel("VELOCITY: —")
+        self.hit_vel_lbl.setAlignment(Qt.AlignCenter)
+        self.hit_vel_lbl.setStyleSheet("font-size:14px;color:#7af0c4;")
+        v.addWidget(self.hit_vel_lbl)
+        col.addWidget(gb)
+
+        gb = QGroupBox("Drum Pads")
+        grid = QGridLayout(gb)
+        self.pads = {}
+        for i, key in enumerate(DRUM_PAD_ORDER):
+            pad = DrumPad(key)
+            pad.clicked.connect(lambda _=False, k=key: self.trigger_test(k))
+            self.pads[key] = pad
+            grid.addWidget(pad, i // 2, i % 2)
+        col.addWidget(gb)
+
+        gb = QGroupBox("CURRENT GESTURE")
+        v = QVBoxLayout(gb)
+        self.gesture_lbl = QLabel("Waiting for gesture...")
+        self.gesture_lbl.setStyleSheet("font-size:16px;font-weight:700;color:#c8cfe0;")
+        self.gesture_lbl.setAlignment(Qt.AlignCenter)
+        v.addWidget(self.gesture_lbl)
+        col.addWidget(gb)
+
+        col.addStretch(1)
+        return col
+
+    # -----------------------------------------------------------
+    def _build_right_column(self):
+        col = QVBoxLayout()
+
+        gb = QGroupBox("MIDI OUTPUT")
+        v = QVBoxLayout(gb)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Port:"))
+        self.midi_combo = QComboBox()
+        row.addWidget(self.midi_combo, 1)
+        self.midi_refresh = QPushButton("Refresh")
+        self.midi_refresh.clicked.connect(self.refresh_midi_ports)
+        row.addWidget(self.midi_refresh)
+        v.addLayout(row)
+        self.midi_connect_btn = QPushButton("Open MIDI")
+        self.midi_connect_btn.clicked.connect(self.on_midi_connect)
+        v.addWidget(self.midi_connect_btn)
+        self.midi_status_lbl = QLabel("Status: Disconnected")
+        v.addWidget(self.midi_status_lbl)
+        self.midi_info_lbl = QLabel("Channel: 10    Last Note: —    Velocity: —")
+        self.midi_info_lbl.setStyleSheet("color:#9ef;font-family:Consolas;")
+        v.addWidget(self.midi_info_lbl)
+        col.addWidget(gb)
+
+        gb = QGroupBox("Settings")
+        v = QVBoxLayout(gb)
+
+        def add_slider(label, key, lo, hi, is_float=False):
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setFixedWidth(150)
+            row.addWidget(lbl)
+            sld = QSlider(Qt.Horizontal)
+            sld.setRange(int(lo), int(hi))
+            sld.setValue(int(self.settings[key]))
+            val_lbl = QLabel(str(self.settings[key]))
+            val_lbl.setFixedWidth(50)
+            val_lbl.setStyleSheet("color:#7af0c4;")
+
+            def _upd(v):
+                self.settings[key] = float(v) if is_float else int(v)
+                val_lbl.setText(str(self.settings[key]))
+                self.engine.update_settings(self.settings)
+
+            sld.valueChanged.connect(_upd)
+            row.addWidget(sld, 1)
+            row.addWidget(val_lbl)
+            v.addLayout(row)
+            return sld
+
+        add_slider("Flex 1 Threshold", "flex1_threshold", 1, 500)
+        add_slider("Flex 2 Threshold", "flex2_threshold", 1, 500)
+        add_slider("Flex 3 Threshold", "flex3_threshold", 1, 500)
+        add_slider("Flex 4 Threshold", "flex4_threshold", 1, 500)
+        add_slider("Movement Threshold", "movement_threshold", 1, 100)
+        add_slider("Cooldown (×0.01 s)", "gesture_cooldown", 5, 100)
+        add_slider("Smoothing (×0.01)", "smoothing", 0, 90)
+        add_slider("Velocity Sensitivity (×0.1)", "velocity_sensitivity", 5, 100)
+
+        # Convert stored defaults into the scaled form used by sliders
+        self.settings["gesture_cooldown"] = self.settings["gesture_cooldown"]
+        col.addWidget(gb)
+
+        gb = QGroupBox("Test Mode (click to send MIDI)")
+        grid = QGridLayout(gb)
+        for i, key in enumerate(DRUM_PAD_ORDER):
+            b = QPushButton(PAD_LABELS[key])
+            b.clicked.connect(lambda _=False, k=key: self.trigger_test(k))
+            grid.addWidget(b, i // 2, i % 2)
+        col.addWidget(gb)
+
+        gb = QGroupBox("Activity Log")
+        v = QVBoxLayout(gb)
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        v.addWidget(self.log)
+        clr = QPushButton("Clear Log")
+        clr.clicked.connect(lambda: self.log.clear())
+        v.addWidget(clr)
+        col.addWidget(gb, 1)
+        return col
+
+    # -----------------------------------------------------------
+    def refresh_ports(self):
+        ports = SerialReader.list_ports()
+        cur = self.port_combo.currentText()
+        self.port_combo.clear()
+        self.port_combo.addItems(ports)
+        if cur and cur in ports:
+            self.port_combo.setCurrentText(cur)
+
+    def refresh_midi_ports(self):
+        ports = MidiEngine.list_outputs()
+        cur = self.midi_combo.currentText()
+        self.midi_combo.clear()
+        self.midi_combo.addItems(ports)
+        if cur and cur in ports:
+            self.midi_combo.setCurrentText(cur)
+        if not ports:
+            self.midi_combo.addItem("(no MIDI outputs)")
+
+    def on_connect(self):
+        port = self.port_combo.currentText().strip()
+        if not port:
+            QMessageBox.warning(self, "No Port", "Select a serial port first.")
+            return
+        self.reader.connect_port(port)
+        self.connect_btn.setEnabled(False)
+        self.disconnect_btn.setEnabled(True)
+
+    def on_disconnect(self):
+        self.reader.disconnect_port()
+        self.connect_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
+
+    def on_connection(self, ok: bool):
+        if ok:
+            self.status_lbl.setText("ESP32 Status: Connected")
+            self.status_lbl.setStyleSheet("color:#7af0c4;font-weight:600;")
+            self.log_line("ESP32 connected.")
+        else:
+            self.status_lbl.setText("ESP32 Status: Disconnected")
+            self.status_lbl.setStyleSheet("color:#ff8080;font-weight:600;")
+            self.connect_btn.setEnabled(True)
+            self.disconnect_btn.setEnabled(False)
+            self.log_line("ESP32 disconnected.")
+
+    def on_error(self, msg: str):
+        self.log_line(f"ERROR: {msg}")
+
+    def on_calibrate(self):
+        if self.reader.port is None:
+            QMessageBox.information(self, "Connect first",
+                                    "Connect to the ESP32 before calibrating.")
+            return
+        self.calib.start(target_samples=40)
+        self.calib_bar.setValue(0)
+        self.calib_status.setText("Calibrating... 0%")
+        self.calib_info.setText("Keep your hand OPEN and STILL.")
+
+    def on_suggest(self):
+        sug = self.calib.suggested_thresholds()
+        self.settings["flex1_threshold"] = sug["f1"]
+        self.settings["flex2_threshold"] = sug["f2"]
+        self.settings["flex3_threshold"] = sug["f3"]
+        self.settings["flex4_threshold"] = sug["f4"]
+        self.engine.update_settings(self.settings)
+        self.log_line(
+            f"Suggested thresholds: F1={sug['f1']}  F2={sug['f2']}  "
+            f"F3={sug['f3']}  F4={sug['f4']}")
+        self.calib_info.setText(
+            "Thresholds applied. Bend fingers and watch the Bend bars.")
+
+    def on_midi_connect(self):
+        name = self.midi_combo.currentText().strip()
+        if not name or name.startswith("("):
+            QMessageBox.warning(self, "No MIDI port",
+                                "No MIDI output selected.\n"
+                                "Install a virtual MIDI port (loopMIDI on Windows).")
+            return
+        if self.midi.open(name):
+            self.midi_status_lbl.setText(f"Status: Connected → {name}")
+            self.midi_status_lbl.setStyleSheet("color:#7af0c4;")
+            self.log_line(f"MIDI opened: {name}")
+        else:
+            self.midi_status_lbl.setText("Status: Failed")
+            self.midi_status_lbl.setStyleSheet("color:#ff8080;")
+            self.log_line(f"MIDI open FAILED: {name}")
+
+    # -----------------------------------------------------------
+    def on_data(self, data: dict):
+        alpha = self.settings["smoothing"]
+        f = {}
+        for k in self._filt:
+            prev = self._filt[k]
+            if prev is None:
+                self._filt[k] = data[k]
+                f[k] = data[k]
+            else:
+                self._filt[k] = alpha * prev + (1 - alpha) * data[k]
+                f[k] = self._filt[k]
+
+        if self.calib.active:
+            pct = self.calib.add_sample(f)
+            self.calib_bar.setValue(pct)
+            self.calib_status.setText(f"Calibrating... {pct}%")
+            if self.calib.complete:
+                self.calib_status.setText("Calibration Complete")
+                self.suggest_btn.setEnabled(True)
+                self.calib_info.setText(
+                    "Baselines: " +
+                    " ".join(f"{k}={self.calib.baseline[k]:.1f}"
+                             for k in ("f1", "f2", "f3", "f4")) +
+                    "\nNow click 'Suggest Thresholds' to auto-tune.")
+                self.log_line("Calibration complete.")
+
+        for i, key in enumerate(("f1", "f2", "f3", "f4")):
+            self.flex_bars[i].set_value(f[key])
+        self.acc_lbl.setText(
+            f"X: {f['ax']:.2f}   Y: {f['ay']:.2f}   Z: {f['az']:.2f}")
+        self.gyro_lbl.setText(
+            f"X: {f['gx']:.1f}   Y: {f['gy']:.1f}   Z: {f['gz']:.1f}")
+
+        if self.calib.complete:
+            bend = {
+                "f1": self.calib.baseline["f1"] - f["f1"],
+                "f2": self.calib.baseline["f2"] - f["f2"],
+                "f3": self.calib.baseline["f3"] - f["f3"],
+                "f4": self.calib.baseline["f4"] - f["f4"],
+            }
+        else:
+            bend = {"f1": 0, "f2": 0, "f3": 0, "f4": 0}
+
+        thr = [
+            self.settings["flex1_threshold"],
+            self.settings["flex2_threshold"],
+            self.settings["flex3_threshold"],
+            self.settings["flex4_threshold"],
+        ]
+        for i, key in enumerate(("f1", "f2", "f3", "f4")):
+            self.bend_bars[i].set_value(bend[key], thr[i])
+
+        dax = f["ax"] - self.calib.baseline["ax"]
+        day = f["ay"] - self.calib.baseline["ay"]
+        daz = f["az"] - self.calib.baseline["az"]
+        acc_mag = (dax * dax + day * day + daz * daz) ** 0.5
+        gyro_mag = (f["gx"] ** 2 + f["gy"] ** 2 + f["gz"] ** 2) ** 0.5
+        movement = acc_mag * 4.0 + gyro_mag * 0.25
+        self.mv_lbl.setText(f"Movement: {movement:.1f}")
+
+    events = self.engine.process(bend, movement)
+    for ev in events:
+        name = ev["name"]
+        note = ev["note"]
+        vel = ev["velocity"]
+        self.midi.send_note(note, vel)
+
+        # UI feedback
+        self.hit_lbl.setText(PAD_LABELS[name])
+        self.hit_note_lbl.setText(f"MIDI NOTE: {note}")
+        self.hit_vel_lbl.setText(f"VELOCITY: {vel}")
+        self.gesture_lbl.setText(name.upper())
+        self.gesture_lbl.setStyleSheet(
+        "font-size:16px;font-weight:700;color:#ffb46b;")
+        if name in self.pads:
+        self.pads[name].flash()
+        self.midi_info_lbl.setText(
+        f"Channel: 10    Last Note: {note}    Velocity: {vel}")
+        self.log_line(
+        f"{PAD_LABELS[name]:<6} MIDI {note:<3} Velocity {vel}")
+
+        QTimer.singleShot(60, lambda n=note: self.midi.send_note_off(n))
+        cur = self.engine.current()
+        if cur is None:
+            self.gesture_lbl.setText("Waiting for gesture...")
+            self.gesture_lbl.setStyleSheet(
+                "font-size:16px;font-weight:700;color:#c8cfe0;")
+
+    # -----------------------------------------------------------
+    def trigger_test(self, key: str):
+        note = note_for(self.mapping, key)
+        vel = 100
+        ok = self.midi.send_note(note, vel)
+        if ok:
+            QTimer.singleShot(60, lambda n=note: self.midi.send_note_off(n))
+            self.log_line(
+                f"TEST  {PAD_LABELS[key]:<6} MIDI {note:<3} Velocity {vel}")
+            self.hit_lbl.setText(PAD_LABELS[key])
+            self.hit_note_lbl.setText(f"MIDI NOTE: {note}")
+            self.hit_vel_lbl.setText(f"VELOCITY: {vel}")
+            if key in self.pads:
+                self.pads[key].flash()
+        else:
+            self.log_line("TEST failed - open a MIDI port first.")
+
+    def log_line(self, text: str):
+        ts = time.strftime("%H:%M:%S")
+        self.log.append(f"{ts}  {text}")
+
+    # -----------------------------------------------------------
+    def closeEvent(self, event):
+        self.reader.disconnect_port()
+        self.midi.close()
+        event.accept()
+
+
+# ------------------------------------------------------------------
+def main():
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
