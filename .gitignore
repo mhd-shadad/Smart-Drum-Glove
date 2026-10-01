@@ -1,6 +1,25 @@
+# Python
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
 .env.local
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+dist/
+build/
+.vite/
+*.log
+
+# OS / Editor
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Model / large binaries (optional — only if you don't want them on GitHub)
+# frontend/public/models/
